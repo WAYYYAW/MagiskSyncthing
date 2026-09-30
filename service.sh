@@ -8,9 +8,17 @@ LOGFILE="$DATA_DIR/syncthing.log"
 STOPPED_FLAG="$DATA_DIR/.stopped"
 BOOTLOG="$MODDIR/service.log"
 WATCHDOG_PID_FILE="$MODDIR/watchdog.pid"
+PROP_FILE="$MODDIR/module.prop"
+BASE_DESC="Run Syncthing natively under media_rw user (UID 1023) to sync /data/media/0 seamlessly. WebUI: http://127.0.0.1:8384."
 
 log_boot() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$BOOTLOG" 2>/dev/null
+}
+
+update_description() {
+    if [ -f "$PROP_FILE" ]; then
+        sed -i "s|^description=.*|description=$1 $BASE_DESC|" "$PROP_FILE" 2>/dev/null
+    fi
 }
 
 # 清理可能残留的旧守护进程
@@ -22,6 +30,7 @@ if [ -f "$WATCHDOG_PID_FILE" ]; then
 fi
 
 echo "=== service.sh triggered at $(date '+%Y-%m-%d %H:%M:%S') ===" > "$BOOTLOG" 2>/dev/null
+update_description "[⏳ 等待启动]"
 
 (
     log_boot "daemon started (pid=$$)"
@@ -32,8 +41,7 @@ echo "=== service.sh triggered at $(date '+%Y-%m-%d %H:%M:%S') ===" > "$BOOTLOG"
     done
     log_boot "sys.boot_completed=1"
 
-    # 2. 等待 FBE (文件级加密) 解密完成且 /data/media/0 可读写
-    # 注意：在锁屏未解锁前 /data/media/0 目录节点本身已存在，但内部处于 fscrypt 加密状态 (Required key not available)
+    # 2. 等待 FBE 解密完成且 /data/media/0 可读写
     until [ -d "/data/media/0/Android" ] && mkdir -p "$DATA_DIR" 2>/dev/null; do
         sleep 3
     done
@@ -45,14 +53,12 @@ echo "=== service.sh triggered at $(date '+%Y-%m-%d %H:%M:%S') ===" > "$BOOTLOG"
     if [ ! -f "$BIN" ] || [ -f "$MODDIR/syncthing" -a "$MODDIR/syncthing" -nt "$BIN" ]; then
         if [ -f "$MODDIR/syncthing" ]; then
             cp -af "$MODDIR/syncthing" "$BIN"
-        elif [ -f "$MODDIR/system/bin/syncthing" ]; then
-            cp -af "$MODDIR/system/bin/syncthing" "$BIN"
         fi
     fi
 
     if [ ! -f "$BIN" ]; then
         log_boot "[ERROR] syncthing binary not found at $BIN"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] syncthing binary not found" >> "$LOGFILE"
+        update_description "[❌ 缺少二进制]"
         exit 1
     fi
 
@@ -78,14 +84,18 @@ echo "=== service.sh triggered at $(date '+%Y-%m-%d %H:%M:%S') ===" > "$BOOTLOG"
         chmod 644 "$LOGFILE" "${LOGFILE}.1" 2>/dev/null
     }
 
-    # 启动 Syncthing (保留 1023 media_rw 身份并赋予 inet 3003 网络权限)
     start_syncthing() {
         rotate_log
         log_boot "starting syncthing..."
         su $SU_OPTS -g 1023 -G 3003 1023 -c "export HOME=\"$DATA_DIR\"; exec \"$BIN\" --home=\"$DATA_DIR\" --no-browser" </dev/null >>"$LOGFILE" 2>&1 &
+        sleep 2
+        PIDS=$(pgrep -f "^$BIN" | tr '\n' ' ' | sed 's/ *$//')
+        if [ -n "$PIDS" ]; then
+            update_description "[🟢 运行中 | PID: $PIDS]"
+            log_boot "syncthing started (PID: $PIDS)"
+        fi
     }
 
-    # 避免重复拉起 (BusyBox pgrep 不支持 -u 参数，使用 ^$BIN 精确匹配进程开头)
     if ! pgrep -f "^$BIN" >/dev/null 2>&1; then
         start_syncthing
     fi
@@ -95,10 +105,11 @@ echo "=== service.sh triggered at $(date '+%Y-%m-%d %H:%M:%S') ===" > "$BOOTLOG"
     # 4. 持续守护进程
     while true; do
         sleep 30
-        [ -f "$MODDIR/disable" ] && exit 0
+        [ -f "$MODDIR/disable" ] && { update_description "[🔴 模块已禁用]"; exit 0; }
         [ -f "$STOPPED_FLAG" ] && continue
 
         if ! pgrep -f "^$BIN" >/dev/null 2>&1; then
+            update_description "[⏳ 正在重启...]"
             log_boot "syncthing not running, restarting..."
             start_syncthing
         fi

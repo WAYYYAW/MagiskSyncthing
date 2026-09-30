@@ -27,14 +27,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Resolve Syncthing version and release tag
+      - name: Resolve Syncthing version and release info
         id: version
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED: ${{ inputs.syncthing_version }}
         run: |
           set -e
-          # 优先级：手动输入版本 > Git Tag（若形如 v2.x.x 且在上游存在） > 上游最新正式版
           if [ -z "$REQUESTED" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             if gh release view "${GITHUB_REF_NAME}" --repo "$SYNCTHING_REPO" --json tagName -q .tagName >/dev/null 2>&1; then
               REQUESTED="${GITHUB_REF_NAME}"
@@ -58,7 +57,6 @@ jobs:
             VERSION="${VERSION}.0"
           done
           VERSION_CODE=$(awk -F. -v v="$VERSION" 'BEGIN{split(v,a,"."); printf "%d", a[1]*1000000 + a[2]*10000 + a[3]*100 + a[4]}')
-          ZIP_NAME="syncthing_media_rw-v${VERSION}.zip"
 
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             RELEASE_TAG="${GITHUB_REF_NAME}"
@@ -72,18 +70,27 @@ jobs:
             echo "kernel_tag=$TAG"
             echo "version=$VERSION"
             echo "version_code=$VERSION_CODE"
-            echo "zip_name=$ZIP_NAME"
             echo "release_tag=$RELEASE_TAG"
             echo "release_name=$RELEASE_NAME"
           } >> "$GITHUB_OUTPUT"
 
           echo "Packaging Syncthing ${TAG} as module v${VERSION} (${SOURCE})"
 
-      - name: Download Syncthing binaries (Android ABIs)
+      - name: Validate shell scripts syntax
+        run: |
+          for f in customize.sh service.sh action.sh uninstall.sh META-INF/com/google/android/update-binary; do
+            sh -n "$f"
+          done
+
+      - name: Build separate module packages for each architecture
         env:
           TAG: ${{ steps.version.outputs.kernel_tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          VERSION_CODE: ${{ steps.version.outputs.version_code }}
         run: |
           set -e
+          mkdir -p dist
+
           declare -A ASSETS=(
             [arm64-v8a]="linux-arm64"
             [armeabi-v7a]="linux-arm"
@@ -96,60 +103,66 @@ jobs:
             [x86_64]="x86-64"
             [x86]="i386|80386"
           )
+
           for abi in arm64-v8a armeabi-v7a x86_64 x86; do
             st="${ASSETS[$abi]}"
             tarball="syncthing-${st}-${TAG}.tar.gz"
             url="https://github.com/${SYNCTHING_REPO}/releases/download/${TAG}/${tarball}"
-            echo "Downloading ${st} -> ${abi}"
+            echo "=============================================="
+            echo "Building package for $abi (${st}) ..."
+            echo "=============================================="
+
             curl -fsSL --retry 3 -o "$tarball" "$url"
             tar -xzf "$tarball"
-            mkdir -p "bin/$abi"
-            mv "syncthing-${st}-${TAG}/syncthing" "bin/$abi/syncthing"
-            chmod 0755 "bin/$abi/syncthing"
-            out=$(file "bin/$abi/syncthing")
+
+            STAGE_DIR="build_stage_${abi}"
+            rm -rf "$STAGE_DIR"
+            mkdir -p "$STAGE_DIR"
+
+            cp -r META-INF system "$STAGE_DIR/"
+            cp customize.sh service.sh action.sh uninstall.sh "$STAGE_DIR/"
+
+            mv "syncthing-${st}-${TAG}/syncthing" "$STAGE_DIR/syncthing"
+            chmod 0755 "$STAGE_DIR/syncthing"
+
+            out=$(file "$STAGE_DIR/syncthing")
             echo "$out"
             echo "$out" | grep -qE "${MAGIC[$abi]}" || { echo "Unexpected ${abi} binary"; exit 1; }
-            rm -rf "syncthing-${st}-${TAG}" "$tarball"
+
+            # 为该架构生成特定的 module.prop
+            sed -e "s/^version=.*/version=v${VERSION}/" \
+                -e "s/^versionCode=.*/versionCode=${VERSION_CODE}/" \
+                module.prop > "$STAGE_DIR/module.prop"
+
+            ZIP_NAME="syncthing_media_rw-v${VERSION}-${abi}.zip"
+            (
+              cd "$STAGE_DIR"
+              zip -r9 "../../dist/${ZIP_NAME}" \
+                META-INF \
+                module.prop \
+                customize.sh \
+                service.sh \
+                action.sh \
+                uninstall.sh \
+                syncthing \
+                system
+            )
+
+            (
+              cd dist
+              sha256sum "$ZIP_NAME" > "${ZIP_NAME}.sha256"
+            )
+
+            rm -rf "syncthing-${st}-${TAG}" "$tarball" "$STAGE_DIR"
           done
 
-      - name: Update module.prop version
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          VERSION_CODE: ${{ steps.version.outputs.version_code }}
-        run: |
-          sed -i "s/^version=.*/version=v${VERSION}/" module.prop
-          sed -i "s/^versionCode=.*/versionCode=${VERSION_CODE}/" module.prop
-          cat module.prop
+          ls -lh dist/
 
-      - name: Validate shell scripts syntax
-        run: |
-          for f in customize.sh service.sh action.sh uninstall.sh META-INF/com/google/android/update-binary; do
-            sh -n "$f"
-          done
-
-      - name: Package Magisk module zip
-        env:
-          ZIP_NAME: ${{ steps.version.outputs.zip_name }}
-        run: |
-          zip -r9 "$ZIP_NAME" \
-            META-INF \
-            module.prop \
-            customize.sh \
-            service.sh \
-            action.sh \
-            uninstall.sh \
-            bin \
-            system
-          sha256sum "$ZIP_NAME" > "${ZIP_NAME}.sha256"
-          unzip -l "$ZIP_NAME"
-
-      - name: Upload build artifact
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.version.outputs.zip_name }}
-          path: |
-            ${{ steps.version.outputs.zip_name }}
-            ${{ steps.version.outputs.zip_name }}.sha256
+          name: syncthing_media_rw-packages
+          path: dist/*
           if-no-files-found: error
 
       - name: Publish GitHub Release
@@ -162,9 +175,12 @@ jobs:
           body: |
             ### Syncthing (media_rw) Magisk / KernelSU / APatch 模块
             - **内置 Syncthing 内核版本**: `${{ steps.version.outputs.kernel_tag }}`
-            - **支持架构**: `arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`（安装时自动识别设备架构）
-            - **运行身份**: `media_rw (UID 1023)` + `inet (GID 3003)`，直接读写 `/data/media/0`
-            - **WebUI 地址**: `http://127.0.0.1:8384`
-          files: |
-            ${{ steps.version.outputs.zip_name }}
-            ${{ steps.version.outputs.zip_name }}.sha256
+            - **独立架构分包**:
+              - `arm64-v8a`: 适用于大多数 64 位现代 Android 设备（推荐）
+              - `armeabi-v7a`: 适用于 32 位 ARM 设备
+              - `x86_64`: 适用于 x86_64 架构模拟器或设备
+              - `x86`: 适用于 x86 架构模拟器
+            - **安装阶段音量键更新**: 安装时自动联网检测官方最新版，支持通过音量键选择是否在线升级对应架构的二进制文件。
+            - **运行身份**: `media_rw (UID 1023)` + `inet (GID 3003)`，直接读写 `/data/media/0` 原生文件系统。
+            - **WebUI 控制台**: `http://127.0.0.1:8384`
+          files: dist/*

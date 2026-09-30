@@ -6,6 +6,14 @@ DATA_DIR="/data/media/0/.syncthing"
 BIN="$DATA_DIR/syncthing"
 LOGFILE="$DATA_DIR/syncthing.log"
 STOPPED_FLAG="$DATA_DIR/.stopped"
+PROP_FILE="$MODDIR/module.prop"
+BASE_DESC="Run Syncthing natively under media_rw user (UID 1023) to sync /data/media/0 seamlessly. WebUI: http://127.0.0.1:8384."
+
+update_description() {
+    if [ -f "$PROP_FILE" ]; then
+        sed -i "s|^description=.*|description=$1 $BASE_DESC|" "$PROP_FILE" 2>/dev/null
+    fi
+}
 
 # 检查当前运行状态 (BusyBox pgrep 不支持 -u，使用 ^$BIN 精确匹配)
 if pgrep -f "^$BIN" >/dev/null 2>&1; then
@@ -33,9 +41,13 @@ if pgrep -f "^$BIN" >/dev/null 2>&1; then
     fi
     
     if ! pgrep -f "^$BIN" >/dev/null 2>&1; then
+        update_description "[🔴 已停止]"
         echo "[-] Syncthing 已成功停止。"
+        echo "[i] 已更新模块描述状态为：已停止"
     else
-        echo "[!] 停止失败，请手动检查进程。"
+        PIDS=$(pgrep -f "^$BIN" | tr '\n' ' ' | sed 's/ *$//')
+        update_description "[🟢 正在运行中 | PID: $PIDS]"
+        echo "[!] 停止失败，请手动检查进程 (PID: $PIDS)。"
     fi
 else
     echo "[*] 启动 Syncthing (用户: media_rw / 1023, 附加组: inet / 3003)..."
@@ -54,7 +66,11 @@ else
             mkdir -p "$DATA_DIR"
             cp -af "$MODDIR/system/bin/syncthing" "$BIN"
         else
+            update_description "[❌ 启动失败: 缺少二进制]"
             echo "[!] 错误: 未找到 syncthing 二进制文件！"
+            echo ""
+            echo "[i] 窗口将在 5 秒后自动关闭..."
+            sleep 5
             exit 1
         fi
     fi
@@ -85,9 +101,11 @@ else
     
     # 等待启动并检测状态
     sleep 2
-    PIDS=$(pgrep -f "^$BIN" | tr '\n' ' ')
+    PIDS=$(pgrep -f "^$BIN" | tr '\n' ' ' | sed 's/ *$//')
     if [ -n "$PIDS" ]; then
+        update_description "[🟢 正在运行中 | PID: $PIDS]"
         echo "[+] 启动成功！PID: $PIDS"
+        echo "[i] 已更新模块描述状态为：正在运行中"
         echo "[i] 本机控制台: http://127.0.0.1:8384"
         
         # 显示当前 WLAN IP 地址以便局域网访问
@@ -96,6 +114,7 @@ else
             echo "[i] Wi-Fi IP: $WLAN_IP"
         fi
     else
+        update_description "[🔴 启动失败]"
         echo "[!] 启动可能失败，请查看日志: $LOGFILE"
         if [ -f "$LOGFILE" ]; then
             echo "--- 日志末尾 5 行 ---"
@@ -103,3 +122,7 @@ else
         fi
     fi
 fi
+
+echo ""
+echo "[i] 操作执行完毕，等待 5 秒后自动关闭..."
+sleep 5
