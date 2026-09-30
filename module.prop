@@ -1,0 +1,6 @@
+id=syncthing_media_rw
+name=Syncthing (media_rw)
+version=v1.1.0
+versionCode=1010
+author=Local
+description=Run Syncthing natively under media_rw user (UID 1023) to sync /data/media/0 seamlessly. WebUI: http://127.0.0.1:8384. Includes auto-start, watchdog and action toggle.

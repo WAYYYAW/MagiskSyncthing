@@ -1,0 +1,13 @@
+# Locally extracted or CI-downloaded Syncthing binaries
+/syncthing
+/bin/
+/system/bin/
+
+# Build artifacts
+*.zip
+*.sha256
+
+# Runtime logs and PID files
+*.log
+*.pid
+.stopped

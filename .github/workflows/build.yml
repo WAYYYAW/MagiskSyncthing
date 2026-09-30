@@ -1,0 +1,170 @@
+name: Build & Release Magisk Module
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      syncthing_version:
+        description: '指定要打包的 Syncthing 版本（如 v2.1.5），留空则自动获取最新正式版'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  SYNCTHING_REPO: syncthing/syncthing
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve Syncthing version and release tag
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.syncthing_version }}
+        run: |
+          set -e
+          # 优先级：手动输入版本 > Git Tag（若形如 v2.x.x 且在上游存在） > 上游最新正式版
+          if [ -z "$REQUESTED" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            if gh release view "${GITHUB_REF_NAME}" --repo "$SYNCTHING_REPO" --json tagName -q .tagName >/dev/null 2>&1; then
+              REQUESTED="${GITHUB_REF_NAME}"
+            fi
+          fi
+
+          if [ -n "$REQUESTED" ]; then
+            TAG="$REQUESTED"
+            SOURCE="requested (${REQUESTED})"
+            gh release view "$TAG" --repo "$SYNCTHING_REPO" --json tagName -q .tagName >/dev/null \
+              || { echo "Syncthing release ${TAG} does not exist"; exit 1; }
+          else
+            TAG=$(gh release list --repo "$SYNCTHING_REPO" --exclude-pre-releases \
+                    --limit 1 --json tagName -q '.[0].tagName')
+            test -n "$TAG" || { echo "No stable Syncthing release found"; exit 1; }
+            SOURCE="latest stable release"
+          fi
+
+          VERSION="${TAG#v}"
+          while [ "$(awk -F. '{print NF}' <<< "$VERSION")" -lt 4 ]; do
+            VERSION="${VERSION}.0"
+          done
+          VERSION_CODE=$(awk -F. -v v="$VERSION" 'BEGIN{split(v,a,"."); printf "%d", a[1]*1000000 + a[2]*10000 + a[3]*100 + a[4]}')
+          ZIP_NAME="syncthing_media_rw-v${VERSION}.zip"
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+            RELEASE_NAME="Syncthing (media_rw) ${GITHUB_REF_NAME} (Syncthing ${TAG})"
+          else
+            RELEASE_TAG="v${VERSION}-build.${GITHUB_RUN_NUMBER}"
+            RELEASE_NAME="Syncthing (media_rw) v${VERSION} (Build #${GITHUB_RUN_NUMBER})"
+          fi
+
+          {
+            echo "kernel_tag=$TAG"
+            echo "version=$VERSION"
+            echo "version_code=$VERSION_CODE"
+            echo "zip_name=$ZIP_NAME"
+            echo "release_tag=$RELEASE_TAG"
+            echo "release_name=$RELEASE_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Packaging Syncthing ${TAG} as module v${VERSION} (${SOURCE})"
+
+      - name: Download Syncthing binaries (Android ABIs)
+        env:
+          TAG: ${{ steps.version.outputs.kernel_tag }}
+        run: |
+          set -e
+          declare -A ASSETS=(
+            [arm64-v8a]="linux-arm64"
+            [armeabi-v7a]="linux-arm"
+            [x86_64]="linux-amd64"
+            [x86]="linux-386"
+          )
+          declare -A MAGIC=(
+            [arm64-v8a]="ARM aarch64"
+            [armeabi-v7a]="ARM, EABI"
+            [x86_64]="x86-64"
+            [x86]="i386|80386"
+          )
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            st="${ASSETS[$abi]}"
+            tarball="syncthing-${st}-${TAG}.tar.gz"
+            url="https://github.com/${SYNCTHING_REPO}/releases/download/${TAG}/${tarball}"
+            echo "Downloading ${st} -> ${abi}"
+            curl -fsSL --retry 3 -o "$tarball" "$url"
+            tar -xzf "$tarball"
+            mkdir -p "bin/$abi"
+            mv "syncthing-${st}-${TAG}/syncthing" "bin/$abi/syncthing"
+            chmod 0755 "bin/$abi/syncthing"
+            out=$(file "bin/$abi/syncthing")
+            echo "$out"
+            echo "$out" | grep -qE "${MAGIC[$abi]}" || { echo "Unexpected ${abi} binary"; exit 1; }
+            rm -rf "syncthing-${st}-${TAG}" "$tarball"
+          done
+
+      - name: Update module.prop version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          VERSION_CODE: ${{ steps.version.outputs.version_code }}
+        run: |
+          sed -i "s/^version=.*/version=v${VERSION}/" module.prop
+          sed -i "s/^versionCode=.*/versionCode=${VERSION_CODE}/" module.prop
+          cat module.prop
+
+      - name: Validate shell scripts syntax
+        run: |
+          for f in customize.sh service.sh action.sh uninstall.sh META-INF/com/google/android/update-binary; do
+            sh -n "$f"
+          done
+
+      - name: Package Magisk module zip
+        env:
+          ZIP_NAME: ${{ steps.version.outputs.zip_name }}
+        run: |
+          zip -r9 "$ZIP_NAME" \
+            META-INF \
+            module.prop \
+            customize.sh \
+            service.sh \
+            action.sh \
+            uninstall.sh \
+            bin \
+            system
+          sha256sum "$ZIP_NAME" > "${ZIP_NAME}.sha256"
+          unzip -l "$ZIP_NAME"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.zip_name }}
+          path: |
+            ${{ steps.version.outputs.zip_name }}
+            ${{ steps.version.outputs.zip_name }}.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.release_tag }}
+          name: ${{ steps.version.outputs.release_name }}
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ### Syncthing (media_rw) Magisk / KernelSU / APatch 模块
+            - **内置 Syncthing 内核版本**: `${{ steps.version.outputs.kernel_tag }}`
+            - **支持架构**: `arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`（安装时自动识别设备架构）
+            - **运行身份**: `media_rw (UID 1023)` + `inet (GID 3003)`，直接读写 `/data/media/0`
+            - **WebUI 地址**: `http://127.0.0.1:8384`
+          files: |
+            ${{ steps.version.outputs.zip_name }}
+            ${{ steps.version.outputs.zip_name }}.sha256
